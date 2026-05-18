@@ -73,6 +73,7 @@ def get_running_jobs_via_api(pat_token: str, job_id: str = JOB_ID) -> list[dict]
             "dc": dc_value,
             "div_nbr": dc_value,
             "text": param_text,
+            "start_time": run.get("start_time"),
         })
     return processed
 
@@ -116,42 +117,75 @@ def parse_run_parameters(text: str) -> tuple[str, str, str]:
     return env_value, app_value, dc_value
 
 
+def _format_duration(start_time_ms: int | None) -> str:
+    """Format elapsed time since start_time_ms (epoch milliseconds) as a human-readable string."""
+    if start_time_ms is None:
+        return "N/A"
+    elapsed_ms = int(time.time() * 1000) - start_time_ms
+    if elapsed_ms < 0:
+        return "N/A"
+    total_secs = elapsed_ms // 1000
+    hours = total_secs // 3600
+    minutes = (total_secs % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def build_running_summary_message(running_jobs: list[dict], validation_results: list[dict] | None = None) -> str:
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     count = len(running_jobs)
     validation_by_run_id = {
         str(item.get("run_id", "")): item for item in (validation_results or [])
     }
+
     lines = [
         "Databricks - RUNNING status summary : SDDOV00000.nt_kafka_read_stream_prod",
         "",
-        "Databricks RUNNING runs",
+        "Continuously running",
         "",
         f"  Count: {count}   Collected at: {collected_at}",
-        "",
-        "Run Parameters",
         "",
     ]
 
     if running_jobs:
-        for idx, item in enumerate(running_jobs):
+        col_div    = "Division"
+        col_lag    = "Offset Lag (Max)"
+        col_dur    = "Duration of Run"
+        col_status = "Status"
+
+        # rows: (division, max_lag, duration, status, job_id)
+        rows: list[tuple[str, str, str, str, str]] = []
+        for item in running_jobs:
             validation = validation_by_run_id.get(str(item["run_id"]), {})
-            metrics = validation.get("metrics", {})
-            lines.append(
-                f"• RUN_ID: {item['run_id']} | "
-                f"ENV: {item['env']} | "
-                f"APP: {item['app']} | "
-                f"DIV_NBR: {item.get('div_nbr', item['dc'])} | "
-                f"JOB_ID: {item['job_id']}"
-            )
-            lines.append(f' "avgOffsetsBehindLatest" : "{metrics.get("avgOffsetsBehindLatest", "N/A")}",')
-            lines.append(f' "estimatedTotalBytesBehindLatest" : "{metrics.get("estimatedTotalBytesBehindLatest", "N/A")}",')
-            lines.append(f'"maxOffsetsBehindLatest" : "{metrics.get("maxOffsetsBehindLatest", "N/A")}",')
-            lines.append(f'"minOffsetsBehindLatest" : "{metrics.get("minOffsetsBehindLatest", "N/A")}"')
-            if idx < len(running_jobs) - 1:  # Add blank line only between jobs, not after the last one
-                lines.append("")
+            metrics    = validation.get("metrics", {})
+            division   = item.get("div_nbr", item.get("dc", "N/A"))
+            max_lag    = metrics.get("maxOffsetsBehindLatest", "N/A")
+            duration   = _format_duration(item.get("start_time"))
+            job_id     = item.get("job_id", "N/A")
+            if metrics:
+                status = "Continuously running" if validation.get("is_zero_lag", False) else "Lag Detected"
+            else:
+                status = "Continuously running"
+            rows.append((division, max_lag, duration, status, job_id))
+
+        # Column width must also account for the indented job_id sub-row under Division
+        w_div    = max(len(col_div),    max(len(r[0]) for r in rows), max(2 + len(r[4]) for r in rows))
+        w_lag    = max(len(col_lag),    max(len(r[1]) for r in rows))
+        w_dur    = max(len(col_dur),    max(len(r[2]) for r in rows))
+        w_status = max(len(col_status), max(len(r[3]) for r in rows))
+
+        def _row(a: str, b: str, c: str, d: str) -> str:
+            return f"  {a.ljust(w_div)}  | {b.ljust(w_lag)}  | {c.ljust(w_dur)}  | {d.ljust(w_status)}"
+
+        sep = f"  {'-' * (w_div + 2)}+{'-' * (w_lag + 2)}+{'-' * (w_dur + 2)}+{'-' * (w_status + 2)}"
+        lines.append(_row(col_div, col_lag, col_dur, col_status))
+        lines.append(sep)
+        for r in rows:
+            lines.append(_row(r[0], r[1], r[2], r[3]))
+            lines.append(f"     Job ID: {r[4]}")
     else:
-        lines.append("  • No active running jobs found.")
+        lines.append("  No active running jobs found.")
 
     # Teams/Power Automate often render line breaks more reliably with CRLF.
     return "\r\n".join(lines)
@@ -290,6 +324,7 @@ def get_running_jobs(driver: webdriver.Edge, limit: int | None = None, wait_seco
                 "dc": dc_value,
                 "div_nbr": dc_value,
                 "text": text_source,
+                "start_time": None,
             }
         )
 
@@ -527,15 +562,11 @@ def build_adaptive_card(pipeline_name: str, running_jobs: list[dict], validation
             body.append({
                 "type": "FactSet",
                 "facts": [
-                    {"title": "RUN_ID", "value": item["run_id"]},
-                    {"title": "JOB_ID", "value": item["job_id"]},
-                    {"title": "ENV", "value": item["env"]},
-                    {"title": "APP", "value": item["app"]},
-                    {"title": "DIV_NBR", "value": item.get("div_nbr", item["dc"])},
-                    {"title": "avgOffsetsBehindLatest", "value": metrics.get("avgOffsetsBehindLatest", "N/A")},
-                    {"title": "estimatedTotalBytesBehindLatest", "value": metrics.get("estimatedTotalBytesBehindLatest", "N/A")},
-                    {"title": "maxOffsetsBehindLatest", "value": metrics.get("maxOffsetsBehindLatest", "N/A")},
-                    {"title": "minOffsetsBehindLatest", "value": metrics.get("minOffsetsBehindLatest", "N/A")},
+                    {"title": "Division", "value": item.get("div_nbr", item.get("dc", "N/A"))},
+                    {"title": "Job ID", "value": item.get("job_id", "N/A")},
+                    {"title": "Offset Lag (Max)", "value": metrics.get("maxOffsetsBehindLatest", "N/A")},
+                    {"title": "Duration of Run", "value": _format_duration(item.get("start_time"))},
+                    {"title": "Status", "value": "Lag Detected"},
                 ],
             })
 
@@ -586,26 +617,60 @@ def send_power_automate_notification(flow_url: str, running_jobs: list[dict], va
                 continue
             metrics = val.get("metrics", {})
             detail_lines_plain.append(
-                f"RUN_ID={item['run_id']} | JOB_ID={item['job_id']} | ENV={item['env']} | APP={item['app']} | "
-                f"DIV_NBR={item.get('div_nbr', item['dc'])} | avgOffsetsBehindLatest={metrics.get('avgOffsetsBehindLatest', 'N/A')} | "
-                f"estimatedTotalBytesBehindLatest={metrics.get('estimatedTotalBytesBehindLatest', 'N/A')} | "
-                f"maxOffsetsBehindLatest={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
-                f"minOffsetsBehindLatest={metrics.get('minOffsetsBehindLatest', 'N/A')}"
+                f"Division={item.get('div_nbr', item.get('dc', 'N/A'))} | "
+                f"Offset Lag (Max)={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
+                f"Duration of Run={_format_duration(item.get('start_time'))} | "
+                f"Status=Lag Detected"
             )
 
-    notification_text = f"ADB MONITORING NOTIFICATION\r\n{status_line}"
-    if detail_lines_plain:
-        notification_text = notification_text + "\r\n\r\n" + "\r\n".join(detail_lines_plain)
+    collected_at_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_color_css = "#D83B01" if has_offset else "#107C10"
+
+    th  = "padding:8px 14px;border:1px solid #D0D0D0;text-align:left;white-space:nowrap;"
+    thr = "background:#1F4E79;color:#fff;"
+    td  = "padding:8px 14px;border:1px solid #D0D0D0;vertical-align:top;"
+
+    validation_map_html = {str(v.get("run_id", "")): v for v in (validation_results or [])}
+
+    table_rows_html = ""
+    for i, item in enumerate(running_jobs):
+        val     = validation_map_html.get(str(item["run_id"]), {})
+        metrics = val.get("metrics", {})
+        div     = item.get("div_nbr", item.get("dc", "N/A"))
+        jid     = item.get("job_id", "N/A")
+        lag     = metrics.get("maxOffsetsBehindLatest", "N/A")
+        dur     = _format_duration(item.get("start_time"))
+        if metrics:
+            st      = "Continuously running" if val.get("is_zero_lag", False) else "Lag Detected"
+            st_col  = "#107C10" if val.get("is_zero_lag", False) else "#D83B01"
+        else:
+            st, st_col = "Continuously running", "#107C10"
+        row_bg = "#F8F8F8" if i % 2 == 0 else "#FFFFFF"
+        table_rows_html += (
+            f"<tr style='background:{row_bg};'>"
+            f"<td style='{td}'><strong>{div}</strong><br/>"
+            f"<span style='color:#666;font-size:11px;'>{jid}</span></td>"
+            f"<td style='{td}'>{lag}</td>"
+            f"<td style='{td}'>{dur}</td>"
+            f"<td style='{td}font-weight:600;color:{st_col};'>{st}</td>"
+            f"</tr>"
+        )
 
     teams_html_body = (
-        "<div style='line-height:1.35;'>"
-        "<div style='font-size:16px;font-weight:700;'><strong>ADB MONITORING NOTIFICATION</strong></div>"
-        f"<div style='margin-top:6px;color:green;font-weight:700;'>{status_line}</div>"
-        "</div>"
+        "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;'>"
+        "<div style='font-size:16px;font-weight:700;margin-bottom:6px;'>ADB MONITORING NOTIFICATION</div>"
+        f"<div style='margin-bottom:4px;color:{status_color_css};font-weight:600;'>{status_line}</div>"
+        f"<div style='margin-bottom:12px;color:#555;font-size:12px;'>Collected at: {collected_at_display} &nbsp;|&nbsp; Count: {job_count}</div>"
+        "<table style='border-collapse:collapse;width:100%;'>"
+        f"<thead><tr style='{thr}'>"
+        f"<th style='{th}{thr}'>Division / Job ID</th>"
+        f"<th style='{th}{thr}'>Offset Lag (Max)</th>"
+        f"<th style='{th}{thr}'>Duration of Run</th>"
+        f"<th style='{th}{thr}'>Status</th>"
+        "</tr></thead>"
+        f"<tbody>{table_rows_html}</tbody>"
+        "</table></div>"
     )
-    if detail_lines_plain:
-        html_details = "<br/><br/>" + "<br/>".join(detail_lines_plain)
-        teams_html_body += html_details
 
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     trace_id = datetime.now(timezone.utc).strftime("TRACE-%Y%m%d-%H%M%S")
@@ -699,11 +764,10 @@ def send_legacy_webhook_notification(
                 continue
             metrics = val.get("metrics", {})
             text_lines.append(
-                f"RUN_ID={item['run_id']} | JOB_ID={item['job_id']} | ENV={item['env']} | APP={item['app']} | "
-                f"DIV_NBR={item.get('div_nbr', item['dc'])} | avgOffsetsBehindLatest={metrics.get('avgOffsetsBehindLatest', 'N/A')} | "
-                f"estimatedTotalBytesBehindLatest={metrics.get('estimatedTotalBytesBehindLatest', 'N/A')} | "
-                f"maxOffsetsBehindLatest={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
-                f"minOffsetsBehindLatest={metrics.get('minOffsetsBehindLatest', 'N/A')}"
+                f"Division={item.get('div_nbr', item.get('dc', 'N/A'))} | "
+                f"Offset Lag (Max)={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
+                f"Duration of Run={_format_duration(item.get('start_time'))} | "
+                f"Status=Lag Detected"
             )
 
     payload = {
@@ -850,8 +914,8 @@ def main() -> None:
             print("\n----- ACTIVE RUNS -----")
             for idx, item in enumerate(pipeline_jobs, start=1):
                 print(
-                    f"{idx}. RUN_ID={item['run_id']} | JOB_ID={item['job_id']} | "
-                    f"ENV={item['env']} | APP={item['app']} | DIV_NBR={item.get('div_nbr', item['dc'])}"
+                    f"{idx}. Division={item.get('div_nbr', item['dc'])} | "
+                    f"ENV={item['env']} | APP={item['app']}"
                 )
 
             pipeline_validations: list[dict] = []
