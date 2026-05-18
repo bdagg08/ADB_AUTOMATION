@@ -132,6 +132,43 @@ def _format_duration(start_time_ms: int | None) -> str:
     return f"{minutes}m"
 
 
+def _max_offset_display(validation: dict | None) -> str:
+    """Return a user-friendly max offset value for output tables/cards."""
+    validation = validation or {}
+    metrics = validation.get("metrics", {}) or {}
+    max_offset = metrics.get("maxOffsetsBehindLatest")
+    if max_offset is not None:
+        return str(max_offset)
+
+    note = (validation.get("note", "") or "").strip()
+    if note:
+        return "Pending"
+
+    return "Skipped"
+
+
+def _estimate_start_time_from_ui_text(text: str) -> int | None:
+    """Best-effort parse of run duration from Databricks row text and convert to epoch ms."""
+    if not text:
+        return None
+
+    compact = re.sub(r"\s+", " ", text).lower()
+
+    day_match = re.search(r"(\d+)\s*(?:d|day|days)\b", compact)
+    hour_match = re.search(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", compact)
+    minute_match = re.search(r"(\d+)\s*(?:m|min|mins|minute|minutes)\b", compact)
+
+    days = int(day_match.group(1)) if day_match else 0
+    hours = int(hour_match.group(1)) if hour_match else 0
+    minutes = int(minute_match.group(1)) if minute_match else 0
+
+    total_minutes = days * 24 * 60 + hours * 60 + minutes
+    if total_minutes <= 0:
+        return None
+
+    return int(time.time() * 1000) - (total_minutes * 60 * 1000)
+
+
 def build_running_summary_message(running_jobs: list[dict], validation_results: list[dict] | None = None, pipeline_name: str = "SDDOV00000.nt_kafka_read_stream_prod") -> str:
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     count = len(running_jobs)
@@ -160,7 +197,7 @@ def build_running_summary_message(running_jobs: list[dict], validation_results: 
             validation = validation_by_run_id.get(str(item["run_id"]), {})
             metrics    = validation.get("metrics", {})
             division   = item.get("div_nbr", item.get("dc", "N/A"))
-            max_lag    = metrics.get("maxOffsetsBehindLatest", "N/A")
+            max_lag    = _max_offset_display(validation)
             duration   = _format_duration(item.get("start_time"))
             job_id     = item.get("job_id", "N/A")
             if metrics:
@@ -314,6 +351,7 @@ def get_running_jobs(driver: webdriver.Edge, limit: int | None = None, wait_seco
             run_job_id = job_id
         text_source = run.get("text", "")
         env_value, app_value, dc_value = parse_run_parameters(text_source)
+        estimated_start_time = _estimate_start_time_from_ui_text(text_source)
 
         processed.append(
             {
@@ -324,7 +362,7 @@ def get_running_jobs(driver: webdriver.Edge, limit: int | None = None, wait_seco
                 "dc": dc_value,
                 "div_nbr": dc_value,
                 "text": text_source,
-                "start_time": None,
+                "start_time": estimated_start_time,
             }
         )
 
@@ -487,6 +525,20 @@ def validate_job_offsets_from_raw_data(driver: webdriver.Edge, running_jobs: lis
                         pass
 
             metrics = _extract_offset_metrics(combined_text)
+            if not metrics:
+                # Retry once because Raw Data can render late for newly started runs.
+                try:
+                    time.sleep(2)
+                    driver.refresh()
+                    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                    time.sleep(1.5)
+                    if not result["raw_data_opened"]:
+                        result["raw_data_opened"] = _open_raw_data_view(driver)
+                    retry_text = driver.find_element(By.TAG_NAME, "body").text
+                    retry_combined_text = f"{retry_text}\n{driver.page_source}"
+                    metrics = _extract_offset_metrics(retry_combined_text)
+                except Exception:
+                    pass
             result["metrics"] = metrics
             print(f"   DEBUG: Extracted metrics for RUN_ID={entry['run_id']}: {metrics}")
 
@@ -564,7 +616,7 @@ def build_adaptive_card(pipeline_name: str, running_jobs: list[dict], validation
                 "facts": [
                     {"title": "Division", "value": item.get("div_nbr", item.get("dc", "N/A"))},
                     {"title": "Job ID", "value": item.get("job_id", "N/A")},
-                    {"title": "Offset Lag (Max)", "value": metrics.get("maxOffsetsBehindLatest", "N/A")},
+                    {"title": "Offset Lag (Max)", "value": _max_offset_display(val)},
                     {"title": "Duration of Run", "value": _format_duration(item.get("start_time"))},
                     {"title": "Status", "value": "Lag Detected"},
                 ],
@@ -618,7 +670,7 @@ def send_power_automate_notification(flow_url: str, running_jobs: list[dict], va
             metrics = val.get("metrics", {})
             detail_lines_plain.append(
                 f"Division={item.get('div_nbr', item.get('dc', 'N/A'))} | "
-                f"Offset Lag (Max)={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
+                f"Offset Lag (Max)={_max_offset_display(val)} | "
                 f"Duration of Run={_format_duration(item.get('start_time'))} | "
                 f"Status=Lag Detected"
             )
@@ -639,7 +691,7 @@ def send_power_automate_notification(flow_url: str, running_jobs: list[dict], va
         metrics = val.get("metrics", {})
         div     = item.get("div_nbr", item.get("dc", "N/A"))
         jid     = item.get("job_id", "N/A")
-        lag     = metrics.get("maxOffsetsBehindLatest", "N/A")
+        lag     = _max_offset_display(val)
         dur     = _format_duration(item.get("start_time"))
         if metrics:
             st      = "Continuously running" if val.get("is_zero_lag", False) else "Lag Detected"
@@ -692,7 +744,7 @@ def send_power_automate_notification(flow_url: str, running_jobs: list[dict], va
             "validation_status": validation_by_run_id.get(str(item["run_id"]), {}).get("note", "N/A"),
             "avgOffsetsBehindLatest": validation_by_run_id.get(str(item["run_id"]), {}).get("metrics", {}).get("avgOffsetsBehindLatest", "N/A"),
             "estimatedTotalBytesBehindLatest": validation_by_run_id.get(str(item["run_id"]), {}).get("metrics", {}).get("estimatedTotalBytesBehindLatest", "N/A"),
-            "maxOffsetsBehindLatest": validation_by_run_id.get(str(item["run_id"]), {}).get("metrics", {}).get("maxOffsetsBehindLatest", "N/A"),
+            "maxOffsetsBehindLatest": _max_offset_display(validation_by_run_id.get(str(item["run_id"]), {})),
             "minOffsetsBehindLatest": validation_by_run_id.get(str(item["run_id"]), {}).get("metrics", {}).get("minOffsetsBehindLatest", "N/A"),
             "display_block": "",
         }
@@ -766,7 +818,7 @@ def send_legacy_webhook_notification(
             metrics = val.get("metrics", {})
             text_lines.append(
                 f"Division={item.get('div_nbr', item.get('dc', 'N/A'))} | "
-                f"Offset Lag (Max)={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
+                f"Offset Lag (Max)={_max_offset_display(val)} | "
                 f"Duration of Run={_format_duration(item.get('start_time'))} | "
                 f"Status=Lag Detected"
             )
@@ -940,7 +992,7 @@ def main() -> None:
                             "   "
                             f"avgOffsetsBehindLatest={metrics.get('avgOffsetsBehindLatest', 'N/A')} | "
                             f"estimatedTotalBytesBehindLatest={metrics.get('estimatedTotalBytesBehindLatest', 'N/A')} | "
-                            f"maxOffsetsBehindLatest={metrics.get('maxOffsetsBehindLatest', 'N/A')} | "
+                            f"maxOffsetsBehindLatest={_max_offset_display(check)} | "
                             f"minOffsetsBehindLatest={metrics.get('minOffsetsBehindLatest', 'N/A')}"
                         )
                     if check["is_zero_lag"]:
