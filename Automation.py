@@ -132,7 +132,7 @@ def _format_duration(start_time_ms: int | None) -> str:
     return f"{minutes}m"
 
 
-def build_running_summary_message(running_jobs: list[dict], validation_results: list[dict] | None = None) -> str:
+def build_running_summary_message(running_jobs: list[dict], validation_results: list[dict] | None = None, pipeline_name: str = "SDDOV00000.nt_kafka_read_stream_prod") -> str:
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     count = len(running_jobs)
     validation_by_run_id = {
@@ -140,7 +140,7 @@ def build_running_summary_message(running_jobs: list[dict], validation_results: 
     }
 
     lines = [
-        "Databricks - RUNNING status summary : SDDOV00000.nt_kafka_read_stream_prod",
+        f"Databricks - RUNNING status summary : {pipeline_name}",
         "",
         "Continuously running",
         "",
@@ -624,6 +624,7 @@ def send_power_automate_notification(flow_url: str, running_jobs: list[dict], va
             )
 
     collected_at_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    table_message = build_running_summary_message(running_jobs, validation_results, pipeline_name=pipeline_name)
     status_color_css = "#D83B01" if has_offset else "#107C10"
 
     th  = "padding:8px 14px;border:1px solid #D0D0D0;text-align:left;white-space:nowrap;"
@@ -958,7 +959,7 @@ def main() -> None:
                 sys.stdout.flush()
 
             print(f"\n----- SUMMARY MESSAGE: {pipeline} -----")
-            print(build_running_summary_message(pipeline_jobs, pipeline_validations))
+            print(build_running_summary_message(pipeline_jobs, pipeline_validations, pipeline_name=pipeline))
 
             # Store pipeline data for concurrent notification
             pipeline_data.append({
